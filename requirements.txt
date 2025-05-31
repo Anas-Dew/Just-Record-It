@@ -1,0 +1,9 @@
+opencv-python==4.8.1.78
+pyautogui==0.9.54
+pillow==10.1.0
+numpy==1.24.3
+pygame==2.5.2
+mss==9.0.1
+pyaudio==0.2.11
+wave==0.0.2
+moviepy==1.0.3 

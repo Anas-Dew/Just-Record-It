@@ -194,6 +194,10 @@ class ScreenRecorder:
         # Self view window
         self.self_view = SelfViewWindow(self)
         
+        # Load cursor image
+        self.cursor_image = None
+        self.load_cursor_image()
+        
         # Create output folder
         if not os.path.exists(self.output_folder):
             os.makedirs(self.output_folder)
@@ -206,6 +210,81 @@ class ScreenRecorder:
         # Start audio monitoring and camera preview
         self.start_audio_monitoring()
         self.start_camera_preview()
+    
+    def load_cursor_image(self):
+        """Load the cursor PNG image for overlay"""
+        try:
+            cursor_path = "cursor.png"
+            if os.path.exists(cursor_path):
+                # Load image with PIL to handle transparency
+                pil_image = Image.open(cursor_path).convert("RGBA")
+                
+                # Resize cursor to appropriate size (24x24 pixels - typical cursor size)
+                cursor_size = (40, 40)
+                pil_image = pil_image.resize(cursor_size, Image.Resampling.LANCZOS)
+                
+                # Convert PIL image to OpenCV format
+                self.cursor_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGBA2BGRA)
+                print("Cursor image loaded successfully")
+            else:
+                print("Cursor image not found, will use default drawing")
+                self.cursor_image = None
+        except Exception as e:
+            print(f"Error loading cursor image: {e}")
+            self.cursor_image = None
+    
+    def overlay_cursor(self, frame, cursor_x, cursor_y):
+        """Overlay cursor PNG image on the frame"""
+        if self.cursor_image is None:
+            # Fallback to drawing circles
+            cv2.circle(frame, (cursor_x, cursor_y), 8, (255, 255, 255), 2)  # White circle
+            cv2.circle(frame, (cursor_x, cursor_y), 6, (0, 0, 0), 2)        # Black inner circle
+            cv2.circle(frame, (cursor_x, cursor_y), 2, (255, 255, 255), -1) # White center dot
+            return
+        
+        cursor_h, cursor_w = self.cursor_image.shape[:2]
+        
+        # Calculate position to center cursor on click point (adjust for cursor hotspot)
+        # Most cursors have their hotspot at the top-left, so we don't offset
+        start_x = cursor_x
+        start_y = cursor_y
+        
+        # Make sure cursor doesn't go out of bounds
+        frame_h, frame_w = frame.shape[:2]
+        
+        # Calculate the region where cursor will be placed
+        end_x = min(start_x + cursor_w, frame_w)
+        end_y = min(start_y + cursor_h, frame_h)
+        
+        # Skip if cursor is completely outside frame
+        if start_x >= frame_w or start_y >= frame_h or start_x < 0 or start_y < 0:
+            return
+        
+        # Calculate how much of the cursor image to use
+        cursor_end_x = cursor_w - max(0, (start_x + cursor_w) - frame_w)
+        cursor_end_y = cursor_h - max(0, (start_y + cursor_h) - frame_h)
+        cursor_start_x = max(0, -start_x)
+        cursor_start_y = max(0, -start_y)
+        
+        # Adjust frame coordinates if cursor starts outside
+        start_x = max(0, start_x)
+        start_y = max(0, start_y)
+        
+        # Get the region of the frame where cursor will be placed
+        frame_region = frame[start_y:end_y, start_x:end_x]
+        cursor_region = self.cursor_image[cursor_start_y:cursor_end_y, cursor_start_x:cursor_end_x]
+        
+        if frame_region.shape[0] > 0 and frame_region.shape[1] > 0 and cursor_region.shape[0] > 0 and cursor_region.shape[1] > 0:
+            # Extract alpha channel for blending
+            alpha = cursor_region[:, :, 3] / 255.0
+            alpha = np.expand_dims(alpha, axis=2)
+            
+            # Blend the cursor with the frame using alpha channel
+            cursor_rgb = cursor_region[:, :, :3]  # BGR channels
+            blended = frame_region * (1 - alpha) + cursor_rgb * alpha
+            
+            # Update the frame
+            frame[start_y:end_y, start_x:end_x] = blended.astype(np.uint8)
     
     def enumerate_devices(self):
         """Enumerate available audio and video devices"""
@@ -496,20 +575,20 @@ class ScreenRecorder:
         # Audio device selection
         ttk.Label(device_frame, text="Microphone:").grid(row=0, column=0, sticky=tk.W, pady=5)
         self.audio_var = tk.StringVar(value="System Default")
-        audio_dropdown = ttk.Combobox(device_frame, textvariable=self.audio_var, 
+        self.audio_dropdown = ttk.Combobox(device_frame, textvariable=self.audio_var, 
                                      values=[device["name"] for device in self.audio_devices],
                                      state="readonly", width=30)
-        audio_dropdown.grid(row=0, column=1, padx=(10, 0), pady=5, sticky=tk.EW)
-        audio_dropdown.bind('<<ComboboxSelected>>', self.on_audio_change)
+        self.audio_dropdown.grid(row=0, column=1, padx=(10, 0), pady=5, sticky=tk.EW)
+        self.audio_dropdown.bind('<<ComboboxSelected>>', self.on_audio_change)
         
         # Camera device selection
         ttk.Label(device_frame, text="Camera:").grid(row=1, column=0, sticky=tk.W, pady=5)
         self.camera_var = tk.StringVar(value="System Default")
-        camera_dropdown = ttk.Combobox(device_frame, textvariable=self.camera_var,
+        self.camera_dropdown = ttk.Combobox(device_frame, textvariable=self.camera_var,
                                       values=[device["name"] for device in self.camera_devices],
                                       state="readonly", width=30)
-        camera_dropdown.grid(row=1, column=1, padx=(10, 0), pady=5, sticky=tk.EW)
-        camera_dropdown.bind('<<ComboboxSelected>>', self.on_camera_change)
+        self.camera_dropdown.grid(row=1, column=1, padx=(10, 0), pady=5, sticky=tk.EW)
+        self.camera_dropdown.bind('<<ComboboxSelected>>', self.on_camera_change)
         
         # Configure device frame grid
         device_frame.columnconfigure(1, weight=1)
@@ -555,16 +634,16 @@ class ScreenRecorder:
         self.record_btn.grid(row=4, column=0, columnspan=2, pady=10, sticky=tk.EW)
         
         # See recordings button
-        recordings_btn = ttk.Button(main_frame, text="See Recordings", 
+        self.recordings_btn = ttk.Button(main_frame, text="See Recordings", 
                                   command=self.open_recordings_folder)
-        recordings_btn.grid(row=5, column=0, columnspan=2, pady=5, sticky=tk.EW)
+        self.recordings_btn.grid(row=5, column=0, columnspan=2, pady=5, sticky=tk.EW)
         
         # Self view toggle
         self.self_view_var = tk.BooleanVar()
-        self_view_check = ttk.Checkbutton(main_frame, text="Self View", 
+        self.self_view_check = ttk.Checkbutton(main_frame, text="Self View", 
                                         variable=self.self_view_var,
                                         command=self.toggle_self_view)
-        self_view_check.grid(row=6, column=0, columnspan=2, pady=10)
+        self.self_view_check.grid(row=6, column=0, columnspan=2, pady=10)
         
         # Status label
         self.status_label = ttk.Label(main_frame, text="Ready to record", 
@@ -580,6 +659,20 @@ class ScreenRecorder:
         main_frame.columnconfigure(0, weight=1)
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
+    
+    def set_ui_controls_enabled(self, enabled):
+        """Enable or disable all UI controls"""
+        state = "normal" if enabled else "disabled"
+        readonly_state = "readonly" if enabled else "disabled"
+        
+        # Disable/enable buttons
+        self.record_btn.config(state=state)
+        self.recordings_btn.config(state=state)
+        self.self_view_check.config(state=state)
+        
+        # Disable/enable dropdowns
+        self.audio_dropdown.config(state=readonly_state)
+        self.camera_dropdown.config(state=readonly_state)
     
     def toggle_recording(self):
         if not self.is_recording:
@@ -657,10 +750,7 @@ class ScreenRecorder:
                         # Get cursor position and draw it on the frame
                         try:
                             cursor_x, cursor_y = pyautogui.position()
-                            # Draw cursor as a small circle
-                            cv2.circle(frame, (cursor_x, cursor_y), 8, (255, 255, 255), 2)  # White circle
-                            cv2.circle(frame, (cursor_x, cursor_y), 6, (0, 0, 0), 2)        # Black inner circle
-                            cv2.circle(frame, (cursor_x, cursor_y), 2, (255, 255, 255), -1) # White center dot
+                            self.overlay_cursor(frame, cursor_x, cursor_y)
                         except:
                             pass  # Skip if cursor position can't be obtained
                         
@@ -733,6 +823,9 @@ class ScreenRecorder:
         self.record_btn.config(text="Start Recording")
         self.status_label.config(text="Processing...")
         
+        # Disable all UI controls during processing
+        self.set_ui_controls_enabled(False)
+        
         # Combine audio and video in a separate thread
         combine_thread = threading.Thread(target=self.combine_audio_video)
         combine_thread.daemon = True
@@ -783,6 +876,9 @@ class ScreenRecorder:
             self.root.after(0, self.processing_finished)
     
     def processing_finished(self):
+        # Re-enable all UI controls after processing
+        self.set_ui_controls_enabled(True)
+        
         self.status_label.config(text="Recording saved!")
         
         # Show success message with option to open file

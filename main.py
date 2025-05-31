@@ -14,13 +14,15 @@ from PIL import Image, ImageTk, ImageDraw, ImageFilter
 import pyaudio
 import wave
 from moviepy.editor import VideoFileClip, AudioFileClip
+import math
 
 class SelfViewWindow:
-    def __init__(self):
+    def __init__(self, parent):
         self.window = None
         self.cap = None
         self.is_running = False
         self.canvas = None
+        self.parent = parent  # Reference to main app for getting selected camera
         
     def create_window(self):
         if self.window:
@@ -46,13 +48,14 @@ class SelfViewWindow:
         # Create circular mask
         self.circle_mask = None
         
-        # Initialize camera
-        self.cap = cv2.VideoCapture(0)
+        # Initialize camera with selected device
+        camera_index = self.parent.get_selected_camera_index()
+        self.cap = cv2.VideoCapture(camera_index)
         if self.cap.isOpened():
             self.is_running = True
             self.update_video()
         else:
-            messagebox.showerror("Error", "Could not access camera")
+            messagebox.showerror("Error", f"Could not access camera at index {camera_index}")
     
     def start_drag(self, event):
         self.x = event.x
@@ -155,8 +158,8 @@ class SelfViewWindow:
 class ScreenRecorder:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Screen Recorder")
-        self.root.geometry("400x300")
+        self.root.title("Just Record It")
+        self.root.geometry("450x800")  # Increased height for better spacing
         self.root.resizable(False, False)
         
         # Recording variables
@@ -173,14 +176,308 @@ class ScreenRecorder:
         self.audio_frames = []
         self.audio_thread = None
         
+        # Audio monitoring
+        self.audio_monitor_active = False
+        self.audio_monitor_thread = None
+        self.current_audio_level = 0
+        self.max_audio_level = 0
+        
+        # Camera preview
+        self.preview_cap = None
+        self.preview_active = False
+        self.preview_canvas = None
+        
+        # Device lists
+        self.audio_devices = []
+        self.camera_devices = []
+        
         # Self view window
-        self.self_view = SelfViewWindow()
+        self.self_view = SelfViewWindow(self)
         
         # Create output folder
         if not os.path.exists(self.output_folder):
             os.makedirs(self.output_folder)
         
+        # Enumerate devices
+        self.enumerate_devices()
+        
         self.setup_ui()
+        
+        # Start audio monitoring and camera preview
+        self.start_audio_monitoring()
+        self.start_camera_preview()
+    
+    def enumerate_devices(self):
+        """Enumerate available audio and video devices"""
+        # Enumerate audio devices
+        try:
+            audio = pyaudio.PyAudio()
+            self.audio_devices = []
+            
+            # Add system default first
+            self.audio_devices.append({"name": "System Default", "index": None})
+            
+            for i in range(audio.get_device_count()):
+                device_info = audio.get_device_info_by_index(i)
+                # Filter for input devices using primary host API only to avoid duplicates
+                if device_info['maxInputChannels'] > 0 and device_info['hostApi'] == 0:
+                    self.audio_devices.append({
+                        "name": device_info['name'],
+                        "index": i
+                    })
+            audio.terminate()
+        except Exception as e:
+            print(f"Error enumerating audio devices: {e}")
+            self.audio_devices = [{"name": "System Default", "index": None}]
+        
+        # Enumerate camera devices
+        self.camera_devices = []
+        self.camera_devices.append({"name": "System Default", "index": 0})
+        
+        # Test camera indices (usually 0-10 is enough)
+        for i in range(1, 11):
+            try:
+                cap = cv2.VideoCapture(i)
+                if cap.isOpened():
+                    # Try to read a frame to confirm it's working
+                    ret, frame = cap.read()
+                    if ret:
+                        self.camera_devices.append({
+                            "name": f"Camera {i}",
+                            "index": i
+                        })
+                cap.release()
+            except:
+                continue
+    
+    def get_selected_audio_device_index(self):
+        """Get the index of the selected audio device"""
+        try:
+            selection = self.audio_var.get()
+            for device in self.audio_devices:
+                if device["name"] == selection:
+                    return device["index"]
+        except:
+            pass
+        return None  # System default
+    
+    def get_selected_camera_index(self):
+        """Get the index of the selected camera device"""
+        try:
+            selection = self.camera_var.get()
+            for device in self.camera_devices:
+                if device["name"] == selection:
+                    return device["index"]
+        except:
+            pass
+        return 0  # Default camera
+    
+    def on_camera_change(self, event=None):
+        """Handle camera selection change"""
+        # Only restart camera preview if self-view is not active
+        if not self.self_view_var.get():
+            self.restart_camera_preview()
+        
+        if self.self_view.window and self.self_view.is_running:
+            # Restart self view with new camera
+            self.self_view.close_window()
+            time.sleep(0.1)  # Small delay
+            self.self_view.create_window()
+    
+    def on_audio_change(self, event=None):
+        """Handle audio device selection change"""
+        # Restart audio monitoring with new device
+        self.restart_audio_monitoring()
+    
+    def start_camera_preview(self):
+        """Start camera preview"""
+        if not self.preview_active and not self.self_view_var.get():  # Don't start if self-view is active
+            self.preview_active = True
+            camera_index = self.get_selected_camera_index()
+            self.preview_cap = cv2.VideoCapture(camera_index)
+            if self.preview_cap.isOpened():
+                self.update_camera_preview()
+    
+    def stop_camera_preview(self):
+        """Stop camera preview"""
+        self.preview_active = False
+        if self.preview_cap:
+            self.preview_cap.release()
+            self.preview_cap = None
+        # Clear the preview canvas
+        if self.preview_canvas:
+            self.preview_canvas.delete("all")
+            self.preview_canvas.create_text(160, 120, text="Camera Preview Disabled\n(Self View Active)", 
+                                          fill="white", font=("Arial", 12), justify=tk.CENTER)
+    
+    def restart_camera_preview(self):
+        """Restart camera preview with new device"""
+        self.stop_camera_preview()
+        time.sleep(0.1)
+        self.start_camera_preview()
+    
+    def update_camera_preview(self):
+        """Update camera preview display"""
+        if self.preview_active and self.preview_cap and self.preview_cap.isOpened() and self.preview_canvas:
+            ret, frame = self.preview_cap.read()
+            if ret:
+                # Flip frame horizontally for mirror effect
+                frame = cv2.flip(frame, 1)
+                
+                # Resize frame to fit preview (320x240)
+                frame = cv2.resize(frame, (320, 240), interpolation=cv2.INTER_AREA)
+                
+                # Convert BGR to RGB
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Convert to PIL Image
+                img = Image.fromarray(frame_rgb)
+                
+                # Convert to PhotoImage
+                photo = ImageTk.PhotoImage(img)
+                
+                # Update canvas
+                self.preview_canvas.delete("all")
+                self.preview_canvas.create_image(160, 120, image=photo)
+                self.preview_canvas.image = photo
+            
+            # Schedule next update
+            if self.preview_active:
+                self.root.after(30, self.update_camera_preview)
+    
+    def calculate_audio_level(self, audio_data):
+        """Calculate audio level in decibels"""
+        try:
+            # Convert bytes to numpy array
+            audio_array = np.frombuffer(audio_data, dtype=np.int16)
+            
+            # Calculate RMS (root mean square)
+            if len(audio_array) > 0:
+                rms = np.sqrt(np.mean(audio_array.astype(np.float64)**2))
+                
+                # Convert to decibels (with reference and minimum threshold)
+                if rms > 0:
+                    # Reference value for 16-bit audio
+                    reference = 32767.0
+                    db = 20 * math.log10(rms / reference)
+                    # Clamp to reasonable range (-60 to 0 dB)
+                    db = max(-60, min(0, db))
+                    return db
+            return -60  # Silence
+        except Exception as e:
+            print(f"Error calculating audio level: {e}")
+            return -60
+    
+    def audio_monitor_worker(self):
+        """Worker thread for monitoring audio levels"""
+        audio = None
+        stream = None
+        
+        try:
+            audio = pyaudio.PyAudio()
+            
+            while self.audio_monitor_active:
+                try:
+                    # Get selected audio device
+                    audio_device_index = self.get_selected_audio_device_index()
+                    
+                    # Setup stream parameters
+                    stream_kwargs = {
+                        'format': self.audio_format,
+                        'channels': 1,  # Use mono for monitoring
+                        'rate': self.audio_rate,
+                        'input': True,
+                        'frames_per_buffer': self.audio_chunk
+                    }
+                    
+                    if audio_device_index is not None:
+                        stream_kwargs['input_device_index'] = audio_device_index
+                    
+                    # Open stream
+                    stream = audio.open(**stream_kwargs)
+                    
+                    # Monitor audio levels
+                    while self.audio_monitor_active:
+                        try:
+                            data = stream.read(self.audio_chunk, exception_on_overflow=False)
+                            level_db = self.calculate_audio_level(data)
+                            
+                            # Update current level
+                            self.current_audio_level = level_db
+                            
+                            # Update max level (decays over time)
+                            if level_db > self.max_audio_level:
+                                self.max_audio_level = level_db
+                            else:
+                                # Decay max level slowly
+                                self.max_audio_level = max(level_db, self.max_audio_level - 0.5)
+                            
+                            # Update UI on main thread
+                            self.root.after_idle(self.update_audio_level_display)
+                            
+                        except Exception as e:
+                            print(f"Audio monitoring error: {e}")
+                            time.sleep(0.1)
+                    
+                    # Close stream
+                    if stream:
+                        stream.stop_stream()
+                        stream.close()
+                        stream = None
+                        
+                except Exception as e:
+                    print(f"Audio stream error: {e}")
+                    time.sleep(1)  # Wait before retry
+                    
+        except Exception as e:
+            print(f"Audio monitoring initialization error: {e}")
+        finally:
+            if stream:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except:
+                    pass
+            if audio:
+                try:
+                    audio.terminate()
+                except:
+                    pass
+    
+    def start_audio_monitoring(self):
+        """Start audio level monitoring"""
+        if not self.audio_monitor_active:
+            self.audio_monitor_active = True
+            self.audio_monitor_thread = threading.Thread(target=self.audio_monitor_worker)
+            self.audio_monitor_thread.daemon = True
+            self.audio_monitor_thread.start()
+    
+    def stop_audio_monitoring(self):
+        """Stop audio level monitoring"""
+        self.audio_monitor_active = False
+        if self.audio_monitor_thread:
+            self.audio_monitor_thread.join(timeout=1)
+    
+    def restart_audio_monitoring(self):
+        """Restart audio monitoring with new device"""
+        self.stop_audio_monitoring()
+        time.sleep(0.1)
+        self.start_audio_monitoring()
+    
+    def update_audio_level_display(self):
+        """Update the audio level display in the UI"""
+        try:
+            # Convert dB to percentage for progress bar (0% = -60dB, 100% = 0dB)
+            percentage = max(0, min(100, (self.current_audio_level + 60) / 60 * 100))
+            
+            # Update progress bar (no color coding)
+            self.audio_level_bar['value'] = percentage
+            
+            # Update label with current dB value
+            self.audio_level_label.config(text=f"Audio Level: {self.current_audio_level:.1f} dB")
+            
+        except Exception as e:
+            print(f"Error updating audio level display: {e}")
     
     def setup_ui(self):
         # Main frame
@@ -188,37 +485,96 @@ class ScreenRecorder:
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         # Title
-        title_label = ttk.Label(main_frame, text="Screen Recorder", 
+        title_label = ttk.Label(main_frame, text="Just Record It", 
                                font=("Arial", 18, "bold"))
         title_label.grid(row=0, column=0, columnspan=2, pady=(0, 20))
+        
+        # Device selection frame
+        device_frame = ttk.LabelFrame(main_frame, text="Device Selection", padding="10")
+        device_frame.grid(row=1, column=0, columnspan=2, pady=(0, 10), sticky=tk.EW)
+        
+        # Audio device selection
+        ttk.Label(device_frame, text="Microphone:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.audio_var = tk.StringVar(value="System Default")
+        audio_dropdown = ttk.Combobox(device_frame, textvariable=self.audio_var, 
+                                     values=[device["name"] for device in self.audio_devices],
+                                     state="readonly", width=30)
+        audio_dropdown.grid(row=0, column=1, padx=(10, 0), pady=5, sticky=tk.EW)
+        audio_dropdown.bind('<<ComboboxSelected>>', self.on_audio_change)
+        
+        # Camera device selection
+        ttk.Label(device_frame, text="Camera:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.camera_var = tk.StringVar(value="System Default")
+        camera_dropdown = ttk.Combobox(device_frame, textvariable=self.camera_var,
+                                      values=[device["name"] for device in self.camera_devices],
+                                      state="readonly", width=30)
+        camera_dropdown.grid(row=1, column=1, padx=(10, 0), pady=5, sticky=tk.EW)
+        camera_dropdown.bind('<<ComboboxSelected>>', self.on_camera_change)
+        
+        # Configure device frame grid
+        device_frame.columnconfigure(1, weight=1)
+        
+        # Camera preview frame
+        preview_frame = ttk.LabelFrame(main_frame, text="Camera Preview", padding="10")
+        preview_frame.grid(row=2, column=0, columnspan=2, pady=(0, 10), sticky=tk.EW)
+        
+        # Camera preview canvas
+        self.preview_canvas = tk.Canvas(preview_frame, width=320, height=240, bg='black')
+        self.preview_canvas.grid(row=0, column=0, pady=5)
+        
+        # Configure preview frame grid
+        preview_frame.columnconfigure(0, weight=1)
+        
+        # Audio level monitoring frame
+        audio_frame = ttk.LabelFrame(main_frame, text="Audio Monitoring", padding="10")
+        audio_frame.grid(row=3, column=0, columnspan=2, pady=(0, 10), sticky=tk.EW)
+        
+        # Audio level label
+        self.audio_level_label = ttk.Label(audio_frame, text="Audio Level: -60.0 dB")
+        self.audio_level_label.grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+        
+        # Audio level progress bar (no color styles)
+        self.audio_level_bar = ttk.Progressbar(audio_frame, length=300, mode='determinate')
+        self.audio_level_bar.grid(row=1, column=0, sticky=tk.EW, pady=(0, 5))
+        
+        # dB scale labels
+        scale_frame = ttk.Frame(audio_frame)
+        scale_frame.grid(row=2, column=0, sticky=tk.EW)
+        
+        ttk.Label(scale_frame, text="-60dB", font=("Arial", 8)).pack(side=tk.LEFT)
+        ttk.Label(scale_frame, text="-30dB", font=("Arial", 8)).pack(side=tk.LEFT, expand=True)
+        ttk.Label(scale_frame, text="0dB", font=("Arial", 8)).pack(side=tk.RIGHT)
+        
+        # Configure audio frame grid
+        audio_frame.columnconfigure(0, weight=1)
         
         # Record button
         self.record_btn = ttk.Button(main_frame, text="Start Recording", 
                                    command=self.toggle_recording,
                                    style="Accent.TButton")
-        self.record_btn.grid(row=1, column=0, columnspan=2, pady=10, sticky=tk.EW)
+        self.record_btn.grid(row=4, column=0, columnspan=2, pady=10, sticky=tk.EW)
         
         # See recordings button
         recordings_btn = ttk.Button(main_frame, text="See Recordings", 
                                   command=self.open_recordings_folder)
-        recordings_btn.grid(row=2, column=0, columnspan=2, pady=5, sticky=tk.EW)
+        recordings_btn.grid(row=5, column=0, columnspan=2, pady=5, sticky=tk.EW)
         
         # Self view toggle
         self.self_view_var = tk.BooleanVar()
         self_view_check = ttk.Checkbutton(main_frame, text="Self View", 
                                         variable=self.self_view_var,
                                         command=self.toggle_self_view)
-        self_view_check.grid(row=3, column=0, columnspan=2, pady=10)
+        self_view_check.grid(row=6, column=0, columnspan=2, pady=10)
         
         # Status label
         self.status_label = ttk.Label(main_frame, text="Ready to record", 
                                     font=("Arial", 10))
-        self.status_label.grid(row=4, column=0, columnspan=2, pady=20)
+        self.status_label.grid(row=7, column=0, columnspan=2, pady=20)
         
         # Recording info
         self.info_label = ttk.Label(main_frame, text="", 
                                    font=("Arial", 8), foreground="gray")
-        self.info_label.grid(row=5, column=0, columnspan=2, pady=5)
+        self.info_label.grid(row=8, column=0, columnspan=2, pady=5)
         
         # Configure grid weights
         main_frame.columnconfigure(0, weight=1)
@@ -332,12 +688,23 @@ class ScreenRecorder:
             # Initialize PyAudio
             audio = pyaudio.PyAudio()
             
-            # Open audio stream
-            stream = audio.open(format=self.audio_format,
-                              channels=self.audio_channels,
-                              rate=self.audio_rate,
-                              input=True,
-                              frames_per_buffer=self.audio_chunk)
+            # Get selected audio device index
+            audio_device_index = self.get_selected_audio_device_index()
+            
+            # Open audio stream with selected device
+            stream_kwargs = {
+                'format': self.audio_format,
+                'channels': self.audio_channels,
+                'rate': self.audio_rate,
+                'input': True,
+                'frames_per_buffer': self.audio_chunk
+            }
+            
+            # Add input_device_index only if not None (system default)
+            if audio_device_index is not None:
+                stream_kwargs['input_device_index'] = audio_device_index
+            
+            stream = audio.open(**stream_kwargs)
             
             # Record audio frames
             while self.is_recording:
@@ -441,13 +808,19 @@ class ScreenRecorder:
     
     def toggle_self_view(self):
         if self.self_view_var.get():
+            # Turn on self-view: stop camera preview
+            self.stop_camera_preview()
             self.self_view.create_window()
         else:
+            # Turn off self-view: restart camera preview
             self.self_view.close_window()
+            self.start_camera_preview()
     
     def on_closing(self):
         # Clean up
         self.is_recording = False
+        self.stop_audio_monitoring()  # Stop audio monitoring
+        self.stop_camera_preview()    # Stop camera preview
         self.self_view.close_window()
         self.root.destroy()
     
